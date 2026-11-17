@@ -63,6 +63,7 @@ tools:
     episodes_per_worker: 16
     max_env_initializations_per_worker: 4
     store_images_on_disk: true
+    record_api_trace: false
     keep_episodes: all
     process_timeout_s: 14400
 

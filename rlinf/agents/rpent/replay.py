@@ -27,8 +27,8 @@ from pathlib import Path
 import torch
 from omegaconf import DictConfig
 
-from rlinf.agents.rpent.episode import episode_output
-from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker, _episode_task
+from rlinf.agents.rpent.episode import episode_output, episode_task
+from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import AgentLoopOutput, MultiAgentLoopOutput
 
@@ -272,7 +272,7 @@ class RPentReplayAgentLoopWorker(RPentAgentLoopWorker):
         candidate = self.rollout_candidate()
         result = await asyncio.to_thread(
             self._saved_batch.load_episode,
-            _episode_task(answer),
+            episode_task(answer),
             merge_prefix=self.cfg.agentloop.merge_prefix_turns,
             max_scored_tokens=self.cfg.agentloop.get(
                 "max_scored_tokens", self.cfg.algorithm.sampling_params.max_new_tokens
@@ -332,7 +332,7 @@ class RPentRecoveryAgentLoopWorker(RPentReplayAgentLoopWorker):
         """Restore admitted data; leave discarded candidates for cancellation."""
         if not self._recovery_pending:
             return await RPentAgentLoopWorker.run_one_query(self, prompt_ids, answer)
-        task = _episode_task(answer)
+        task = episode_task(answer)
         candidate = self.rollout_candidate()
         candidate_id = candidate["candidate_id"] if candidate else None
         if candidate_id is None or self._recovery_tasks[candidate_id] != task:

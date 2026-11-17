@@ -1,0 +1,20 @@
+# Shared preprocessing for Qwen3.5 episode training and evaluation.
+tools:
+  rpent:
+    training_image_prefetch_batches: 2
+    training_image_prefetch_bytes: 1073741824
+rollout:
+  env_vars:
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
+  gpu_memory_utilization: 0.55
+  sglang:
+    disable_fast_image_processor: true
+    image_processor_backend: pil
+    enable_token_space_processor: true
+    enable_token_space_preprocess_cache: true
+    token_space_preprocess_cache_dir: ???
+    token_space_preprocess_cache_trust_url: true
+    token_space_preprocess_cache_check_rate: 0.01
+actor:
+  megatron:
+    mbridge: true

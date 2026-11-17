@@ -1,0 +1,2 @@
+# RPent Qwen3.5 input-contract profile; select with --sglang token-space.
+-r sglang-token-space.txt

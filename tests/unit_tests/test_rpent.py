@@ -100,6 +100,8 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
 def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_path):
     import hashlib
 
+    from rlinf.agents.rpent.episode import Episode
+    from rlinf.agents.rpent.records import write_training_turn
     from rlinf.agents.rpent.replay import SavedRPentBatch
 
     def write(path, value):
@@ -155,7 +157,34 @@ def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_p
             "image_grid_thw": [[1, 2, 2]],
             "multimodal_contract": contract,
         }
-        turn_hash = write(directory / "training_audit/turn-00000.json", turn)
+        write_training_turn(
+            str(tmp_path),
+            Episode(directory.name, task, SimpleNamespace(chain_id=0)),
+            AgentLoopOutput(
+                prompt_ids=turn["input_ids"],
+                response_ids=turn["output_ids"],
+                response_mask=turn["response_mask"],
+                response_images={
+                    **contract,
+                    "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                },
+                extra_fields={"turn_id": 0, "tool_names": []},
+            ),
+            {
+                "logprobs": turn["behavior_logprobs"],
+                "weight_versions": [0],
+                "version_start": 0,
+                "version_end": 0,
+                "prompt_token_ids": turn["input_ids"],
+                "finish_reason": "stop",
+            },
+            [],
+            0.0,
+            {},
+        )
+        turn_hash = hashlib.sha256(
+            (directory / "training_audit/turn-00000.json").read_bytes()
+        ).hexdigest()
         records.append(
             {
                 "candidate_id": candidate,
@@ -987,29 +1016,111 @@ def test_tokenspace_grouped_grpo_keeps_native_loss_scales_without_a_critic():
     assert cfg.tools.rpent.entrypoint == "robots.rl.rl_episode"
 
 
-def test_grpo_recipe_accepts_token_space_without_critic_and_hierarchical_scales(
-    tmp_path,
-):
-    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+@pytest.fixture
+def episode_launcher(tmp_path, monkeypatch):
+    from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
 
-    cfg = compose(
-        config_name="train_qwen3.5_4b_episode_sync_grpo",
-        overrides=[
-            "tools.rpent.repo_path=/test/rpent",
-            "tools.rpent.remote_toolkit_endpoint=http://127.0.0.1:28490",
-            f"rollout.sglang.token_space_preprocess_cache_dir={tmp_path}",
-        ],
+    (tmp_path / "episode_fixture.py").write_text(
+        "import argparse,json,os,time\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request',type=Path)\n"
+        "p.add_argument('--output-dir',type=Path)\n"
+        "a,extra=p.parse_known_args()\n"
+        "r=json.loads(a.request.read_text())\n"
+        "(a.output_dir/'pid').write_text(str(os.getpid()))\n"
+        "(a.output_dir/'states.json').write_text('{}')\n"
+        "time.sleep(r['task'].get('sleep',0))\n"
+        "(a.output_dir/'outcome.json').write_text(json.dumps({\n"
+        " 'success':False,'owner':os.environ.get('RPENT_REMOTE_OWNER_ID'),\n"
+        " 'egl':os.environ.get('MUJOCO_EGL_DEVICE_ID'),'args':extra}))\n"
     )
-    validated = validate_rpent_cfg(cfg)
-    assert not validated.critic.use_critic_model
-    assert validated.algorithm.clip_ratio_high == 0.28
-    assert list(validated.algorithm.loss_scales) == [
-        "group_level",
-        "agent_level",
-        "turn_level",
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "inherited-device")
+    cfg = OmegaConf.create(
+        {
+            "rollout": {"model": {"model_path": "unused"}},
+            "agentloop": {"prompt": "simple"},
+            "tools": {
+                "rpent": {
+                    "python": sys.executable,
+                    "repo_path": str(tmp_path),
+                    "workflow": "episode",
+                    "entrypoint": "episode_fixture",
+                    "remote_toolkit_endpoint": "http://unused",
+                    "image_size": 1024,
+                    "action_mode": "batch",
+                    "max_actions_per_call": 3,
+                    "perception_mode": "single",
+                    "reasoning_history": -1,
+                    "image_history": -1,
+                    "max_episode_steps": 10000,
+                    "max_env_initializations_per_worker": 1,
+                    "output_dir": str(tmp_path / "episodes"),
+                    "keep_episodes": "none",
+                    "process_timeout_s": 20,
+                }
+            },
+        }
+    )
+    return RPentEpisodeLauncher(cfg)
+
+
+def test_episode_launcher_keeps_candidates_and_preserves_workflow(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "grouped", "candidate_id": 9}
+    episode = Episode("candidate", {}, None)
+    result = asyncio.run(launcher.run(episode, {}, 3, candidate=candidate))
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "candidate"
+    assert result["owner"] == "candidate" and result["egl"] is None
+    assert "--record-api-trace" not in result["args"]
+    assert result["args"][result["args"].index("--max-actions-per-call") + 1] == "3"
+    assert result["args"][result["args"].index("--cuda-device") + 1] == "3"
+    assert json.loads((output / "sampling-candidate.json").read_text()) == {
+        **candidate,
+        "episode_id": "candidate",
+    }
+    assert json.loads((output / "sampling-process-cleanup.json").read_text()) == {
+        "process_exited": True,
+        "returncode": 0,
+    }
+    asyncio.run(launcher.run(Episode("ordinary", {}, None), {}, 3))
+    assert not (output.parent / "ordinary").exists()
+
+
+def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
+    episode_launcher,
+):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "cancelled", "candidate_id": 0}
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "cancelled"
+
+    async def run():
+        task = asyncio.create_task(
+            launcher.run(
+                Episode("cancelled", {"sleep": 60}, None), {}, 0, candidate=candidate
+            )
+        )
+
+        async def started():
+            while not (output / "pid").exists():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(started(), timeout=10)
+        pid = int((output / "pid").read_text())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        await asyncio.wait_for(
+            launcher.run(Episode("after-cancel", {}, None), {}, 0), timeout=10
+        )
+
+    asyncio.run(run())
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
     ]
-    assert (validated.data.rollout_batch_size, validated.data.sampling_batch_size) == (
-        32,
-        40,
-    )
-    assert validated.algorithm.group_size == 8

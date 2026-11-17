@@ -756,6 +756,7 @@ def _run_redirected_entrypoint(tmp_path, outcome):
     )
 
 
+@pytest.mark.placement
 def test_redirected_entrypoint_exits_zero_and_keeps_its_log(tmp_path):
     result = _run_redirected_entrypoint(tmp_path, "return")
 
@@ -763,6 +764,7 @@ def test_redirected_entrypoint_exits_zero_and_keeps_its_log(tmp_path):
     assert "entrypoint ran" in (tmp_path / "exp" / "log" / "main.log").read_text()
 
 
+@pytest.mark.placement
 def test_redirected_entrypoint_failure_is_not_reported_as_success(tmp_path):
     # Hydra catches the exception and calls sys.exit(1) itself, so the failure
     # never reaches sys.excepthook.
@@ -1184,6 +1186,7 @@ def megatron_cpu(monkeypatch, tmp_path):
     from megatron.core import parallel_state
 
     from rlinf.scheduler import Worker
+    from rlinf.utils.multimodal import MultimodalBatchPreparer
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
     from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
@@ -1220,6 +1223,9 @@ def megatron_cpu(monkeypatch, tmp_path):
             }
         )
         worker.transformer_config = SimpleNamespace(sequence_parallel=False)
+        worker.multimodal_preparer = MultimodalBatchPreparer(
+            worker.cfg.rollout.model.model_path
+        )
         worker.lm_head_chunk_size = 0
         worker.response_only_logits = False
         worker.scoring_forward = None

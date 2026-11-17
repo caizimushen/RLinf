@@ -1,7 +1,7 @@
 配置 RPent 多模态训练
 ============================
 
-先完成 :doc:`单机 smoke <../../examples/agentic/rpent_libero_rl>`，再按需要调整重算、缓存和历史处理。默认路径与实验性 TokenSpace 路径使用独立依赖环境。
+先完成 :doc:`单机单任务检查 <../../examples/agentic/rpent_libero_rl>`，再按需要调整重算、缓存和历史处理。默认路径与实验性 TokenSpace 路径使用独立依赖环境。
 
 启用 Logprob 重算与 TIS
 --------------------------
@@ -31,13 +31,13 @@ TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核�
 
 .. warning::
 
-   这条路径仍处于实验阶段。默认的 SGLang 0.5.12.post1 环境不能运行此模式。候选依赖文件 ``requirements/agentic/sglang-token-space.txt`` 固定了 SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``、Torch 2.14.1 和 Transformers 5.19.0。请准备独立环境，并重新匹配 CUDA、Megatron-Bridge 等训练内核；仍需在这个环境中联合验证 GPU 推理服务、权重同步和训练。保留现有训练环境。
+   默认 SGLang 0.5.12.post1 环境不能运行此模式。按 :doc:`episode 训练示例 <../../examples/agentic/rpent_episode_sync>` 安装独立的 CUDA 13 环境；该配置固定 SGLang 源码、Torch 2.14.1、Transformers 5.19.0，安装匹配的 Megatron-Bridge 依赖并应用 TE/FA4 窗口适配。新环境部署前须核实 GPU 推理、权重同步、完整更新和恢复。保留运行中作业的环境。
 
    这个开发版仅用于显式设置 ``rollout.sglang.enable_token_space_processor=true`` 的 rollout。其他 rollout 路径以及独立的奖励模型、具身推理服务会在启动前拒绝该版本。这些任务应使用受支持的 SGLang 发布版，不能因为安装成功就认定兼容。
 
 受支持的 SGLang 发布版统一使用 ``rollout.cuda_graph_max_bs`` 配置项。SGLang 0.5.19 更改了对应服务参数的名称，RLinf 会完成映射，并将实际取值限制在 ``rollout.max_running_requests`` 以内。关闭 TokenSpace 时也适用这些规则。Search-R1 和具身任务的 GPU 回归尚未完成。
 
-新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同路径访问 ``output_dir``。
+新环境通过验证后，在部署配置中启用以下设置。从 rollout 环境中移除 ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE``，同时检查启动 shell 是否继承了这个变量。rollout、actor 和 critic 节点须能通过相同的绝对路径访问 ``tools.rpent.output_dir``。
 
 .. code-block:: yaml
 
@@ -53,7 +53,7 @@ TokenSpace 模式让 rollout 和训练复用 SGLang 的图像预处理。它核�
 
 切换模式时使用全新的 rollout 状态。异步 checkpoint 恢复会拒绝不同模式，训练端也会拒绝 Processor 指纹变化或混合图像格式。Torch 和内核升级后，不能直接假定旧 optimizer 状态仍然兼容。恢复 checkpoint 前须保留其引用的图像文件。
 
-训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再按固定的 96 点方案比较 logprob，记录平均值、P95 和最大绝对误差，以 0.03/0.10 为诊断参考。验收还需确认 Token、图片和位置输入正确，更新数值有限，权重同步及新进程恢复成功；重算和 TIS 不能证明原生数值一致。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
+训练验收前，先在部署环境验证多轮图像、历史压缩和打包后的 M-RoPE。再用固定的相同 token、图片输入比较 logprob，记录采样方案、平均值、P95 和最大绝对误差。验收还需确认 Token、图片和位置输入正确，更新数值有限，权重同步及新进程恢复成功；重算和 TIS 不能证明原生数值一致。基础模型 logprob 与经过采样惩罚、top-k、top-p 修改的概率须分开比较。CPU 输入检查不能证明 GPU 数值对齐。
 
 减少重复图像预处理
 ~~~~~~~~~~~~~~~~~~
@@ -83,7 +83,7 @@ TokenSpace 模式可以让 rollout、actor 和 critic 共用图像预处理缓�
 
    缓存读取会反序列化 Python 对象，目录只能由可信进程写入。原生磁盘缓存没有淘汰机制或容量上限，须使用作业专属目录，并配置文件系统配额或外部容量监控。所有作业进程退出后才能清理缓存；checkpoint 恢复依赖的图片文件须保留。新进程从保存的图片引用重建 CPU 预取队列。
 
-CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 上的 logprob、训练梯度和吞吐，以及在新进程中恢复训练的行为，仍需在部署环境验证。每项优化须与同一后端关闭该选项的结果比较；跨后端的 96 点误差单独报告，不能用算法校正后的结果代替。
+CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 上的 logprob、训练梯度和吞吐，以及在新进程中恢复训练的行为，仍需在部署环境验证。每项优化须与同一后端关闭该选项的结果比较；固定输入集的跨后端误差单独报告，不能用算法校正后的结果代替。
 
 可选运行设置
 ------------

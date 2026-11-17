@@ -77,7 +77,7 @@ The following examples include math reasoning RL and agentic AI workflows, such 
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
        <a href="rpent_episode_sync.html"><img src="https://github.com/RLinf/misc/raw/main/pic/rpent_framework.png"
             style="width: 100%; height: 200px; object-fit: contain; border-radius: 8px;" /></a>
-       <p><a href="rpent_episode_sync.html"><b>RPent Episode PPO</b></a><br>
+       <p><a href="rpent_episode_sync.html"><b>RPent Episode PPO / GRPO</b></a><br>
          Train a tool-based episode planner with remote LIBERO-PRO environments and SAM3
        </p>
      </div>
@@ -126,6 +126,6 @@ The following examples include math reasoning RL and agentic AI workflows, such 
    rStar2 <rstar2>
    RPent <rpent>
    RPent Multimodal RL <rpent_libero_rl>
-   RPent Episode PPO Across Clusters <rpent_episode_sync>
+   RPent Episode PPO / GRPO Across Clusters <rpent_episode_sync>
    Math Reasoning <math_reasoning/index>
    Qwen3 VL GRPO <qwen3_vl_geo3k>

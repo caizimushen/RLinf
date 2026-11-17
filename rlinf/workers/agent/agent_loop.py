@@ -43,7 +43,6 @@ from rlinf.utils.metric_utils import aggregate_agent_metrics
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.partial_rollout import PartialRolloutMixin
 from rlinf.workers.agent.tool_worker import ToolChannelInfo
-from rlinf.workers.rollout.utils import green
 
 
 @dataclass
@@ -321,14 +320,13 @@ class AgentLoopWorker(Worker):
         prompt_texts: Optional[str],
         trace_prints: list[Any],
     ):
-        print_texts = []
+        lines = []
         if prompt_texts is not None:
-            print_texts = [
-                f"{green('Prompt')}         : {prompt_texts!r}",
-            ]
+            lines.append(f"Prompt: {prompt_texts!r}")
         for trace_print in trace_prints:
-            print_texts.append(f"{green('Trace print')}    : {trace_print!r}")
-        print(*print_texts, sep="\n")
+            lines.append(f"Agent output: {trace_print!r}")
+        if lines:
+            self.log_info("\n".join(lines))
 
     def get_tool_response_ids(self, tool_messages: list[dict]):
         """

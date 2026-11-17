@@ -1,7 +1,7 @@
 Configure RPent Multimodal Training
 ===================================
 
-Use these options after completing :doc:`the single-node smoke <../../examples/agentic/rpent_libero_rl>`. Keep the default and experimental TokenSpace environments separate.
+Use these options after completing :doc:`the single-node episode check <../../examples/agentic/rpent_libero_rl>`. Keep the default and experimental TokenSpace environments separate.
 
 Enable Logprob Recalculation and TIS
 ---------------------------------------------
@@ -31,13 +31,13 @@ Token-space mode uses SGLang's image preprocessing for rollout and training. It 
 
 .. warning::
 
-   This path is experimental. The default SGLang 0.5.12.post1 environment cannot run it. The candidate dependency file, ``requirements/agentic/sglang-token-space.txt``, pins SGLang commit ``18a44326f6de5134fe921927d760d81f8ee48fc9``, Torch 2.14.1 and Transformers 5.19.0. Prepare a separate environment with matching CUDA and Megatron-Bridge kernels; GPU serving, weight synchronization and training still need to be validated together in this environment. Keep the existing training environment unchanged.
+   The default SGLang 0.5.12.post1 environment cannot run this mode. Use the separate CUDA 13 profile described in :doc:`the episode training recipe <../../examples/agentic/rpent_episode_sync>`. It pins the SGLang source, Torch 2.14.1 and Transformers 5.19.0, installs matching Megatron-Bridge dependencies and applies the TE/FA4 window adapter. Verify GPU serving, weight synchronization, a complete update and recovery before deploying a new installation. Keep active training environments unchanged.
 
    RLinf permits this development build only for rollout with ``rollout.sglang.enable_token_space_processor=true``. Other rollout paths and standalone reward or embodied servers reject it before launch. Use a supported SGLang release for those workloads; installing this build does not establish their compatibility.
 
 Keep using ``rollout.cuda_graph_max_bs`` with supported SGLang releases, including 0.5.19, which renamed the corresponding server option. RLinf caps the value at ``rollout.max_running_requests``. These rules also apply when TokenSpace is disabled. GPU regression checks for Search-R1 and embodied workloads remain pending.
 
-After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Keep ``output_dir`` accessible at the same path on rollout, actor and critic nodes.
+After validating that environment, enable the following settings in the deployment profile. Remove ``SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE`` from the rollout environment, including inherited shell settings. Make ``tools.rpent.output_dir`` accessible at the same absolute path on rollout, actor and critic nodes.
 
 .. code-block:: yaml
 
@@ -53,7 +53,7 @@ Rollout initialization fails if the TokenSpace APIs are unavailable. Both Server
 
 Start with fresh rollout state when switching modes. Async checkpoint recovery rejects a different mode, and the learner rejects changed processor fingerprints or mixed media formats. Do not assume optimizer state is portable across the Torch/kernel upgrade. Retain image files for checkpoint recovery.
 
-To validate the stack for training, first verify multi-turn images, compaction and packed M-RoPE in the deployment environment. Then run the fixed 96-point logprob comparison. Report mean, P95 and maximum absolute error, with 0.03/0.10 as diagnostic references. Acceptance also requires correct token/image/position inputs, finite updates, weight synchronization and recovery in a new process; recalculation and TIS do not prove native numerical parity. Compare base model logprobs separately from probabilities modified by sampling penalties, top-k and top-p. CPU input checks do not establish GPU numerical parity.
+To validate the stack for training, first verify multi-turn images, compaction and packed M-RoPE in the deployment environment. Then compare logprobs on a fixed set of identical token/image inputs. Report the sampling protocol, mean, P95 and maximum absolute error. Acceptance also requires correct token/image/position inputs, finite updates, weight synchronization and recovery in a new process; recalculation and TIS do not prove native numerical parity. Compare base model logprobs separately from probabilities modified by sampling penalties, top-k and top-p. CPU input checks do not establish GPU numerical parity.
 
 Reduce Repeated Image Preprocessing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -83,7 +83,7 @@ The prefetch settings limit the number and total bytes of prepared microbatches 
 
    Only trusted processes may write the cache directory: cache reads deserialize Python objects. The native disk cache has no eviction or disk-size limit. Use a job-owned directory with a filesystem quota or external capacity monitoring. Remove it only after all job processes have exited; image files must remain available for checkpoint recovery. A new process rebuilds its CPU prefetch queue from the saved image references.
 
-CPU tests cover cache reuse, image integrity, prefetch ordering and thread cleanup. Validate GPU logprobs, training gradients, throughput and training recovery in a new process in the deployment environment. Compare each optimization against the same backend with the option disabled; report the separate 96-point cross-backend diagnostic alongside those results.
+CPU tests cover cache reuse, image integrity, prefetch ordering and thread cleanup. Validate GPU logprobs, training gradients, throughput and training recovery in a new process in the deployment environment. Compare each optimization against the same backend with the option disabled; report the separate cross-backend diagnostic on the fixed input set alongside those results.
 
 Optional Runtime Settings
 -------------------------

@@ -407,7 +407,6 @@ class SGLangWorker(Worker):
             return_logprob=False,
         )
         print_sglang_outputs(self._validate_prompts, engine_results, self._tokenizer)
-        print("===============================", flush=True)
 
     async def async_generate(
         self,

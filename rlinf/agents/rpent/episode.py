@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field, replace
 
@@ -44,6 +45,15 @@ class Episode:
     started: float = field(default_factory=time.monotonic)
     turns: list[AgentLoopOutput] = field(default_factory=list)
     weight_version: int | None = None
+
+
+def episode_task(answer: list[str]) -> dict:
+    """Decode the single task carried by one reasoning dataset row."""
+    if len(answer) != 1:
+        raise ValueError(
+            f"an RPent dataset row must specify exactly one task, got {len(answer)}"
+        )
+    return json.loads(answer[0])
 
 
 def merge_prefix_turns(

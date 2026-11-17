@@ -159,6 +159,8 @@ Common options:
                            twice with different --venv to get both.
     --sglang <version>     Override sglang version (e.g., 0.5.4). Must be one of the
                            versions in requirements/agentic/; torch is derived from it.
+                           token-space selects the CUDA 13 RPent Qwen3.5 profile;
+                           pass --torch 2.14.1 --transformers 5.19.0 --python 3.12.12.
                            Applies to target agentic and to --model sglang / qwen3_vl.
     --vllm <version>       Override vllm version (e.g., 0.23.0). Must be one of the
                            versions in requirements/agentic/.
@@ -1556,6 +1558,34 @@ agentic_torch_for_engine() {
 
 engine_needs_torch211() {
     [ "$(agentic_torch_for_engine)" = "-" ]
+}
+
+apply_te_fa4_compatibility() {
+    local package patch_file
+    patch_file="$SCRIPT_DIR/agentic/transformer-engine-2.17-fa4-window.patch"
+    package=$(python - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+import os
+import shutil
+import tempfile
+
+dist = distribution("transformer-engine")
+if dist.version != "2.17.0":
+    raise SystemExit(f"Expected transformer-engine 2.17.0, found {dist.version}")
+package = Path(dist.locate_file("transformer_engine"))
+target = package / "pytorch/attention/dot_product_attention/backends.py"
+# uv may hardlink installed files to its cache. Modify only this environment.
+with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as private:
+    shutil.copy2(target, private.name)
+os.replace(private.name, target)
+print(package)
+PY
+    ) || return $?
+    if patch --batch --reverse --dry-run -p1 -d "$package" < "$patch_file" >/dev/null 2>&1; then
+        return 0
+    fi
+    patch --batch --forward -p1 -d "$package" < "$patch_file"
 }
 
 agentic_cuda_line() {
@@ -4646,9 +4676,16 @@ install_agentic() {
     local engine engine_ver torch211_stack=0
     engine=$(effective_engine)
     engine_ver=$(effective_engine_version)
+    if [ "$engine:$engine_ver" = "sglang:token-space" ]; then
+        if [ "$PLATFORM" != nvidia ] || [ "${TORCH_VERSION:-}" != 2.14.1 ] \
+            || [ "${TRANSFORMERS_VERSION:-}" != 5.19.0 ] || [ "${UNINSTALL_FA4:-0}" = 1 ]; then
+            echo "[install.sh] token-space needs NVIDIA CUDA 13, --torch 2.14.1, --transformers 5.19.0 and UNINSTALL_FA4=0." >&2
+            return 1
+        fi
+    fi
     if engine_needs_torch211; then
         torch211_stack=1
-        echo "[install.sh] ${engine} ${engine_ver} runs on torch 2.11: using TE 2.17, mcore 0.18, megatron-bridge."
+        echo "[install.sh] ${engine} ${engine_ver}: using TE 2.17, mcore 0.18 and Megatron-Bridge."
     fi
 
     local engine_req
@@ -4674,6 +4711,9 @@ install_agentic() {
     [ "$torch211_stack" -eq 1 ] && megatron_branch="core_r0.18.0"
     local megatron_dir
     megatron_dir=$(clone_or_reuse_repo MEGATRON_PATH "$VENV_DIR/Megatron-LM" https://github.com/NVIDIA/Megatron-LM.git -b "$megatron_branch")
+    if [ "$engine:$engine_ver" = "sglang:token-space" ] && [ -z "${MEGATRON_PATH:-}" ]; then
+        git -C "$megatron_dir" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
+    fi
 
     if [ "$torch211_stack" -eq 1 ] && [ -z "${MEGATRON_PATH:-}" ]; then
         # Preserve CPU-offloaded master weights and Adam counters on resume.
@@ -4723,6 +4763,9 @@ install_agentic() {
         install_flash_attn
     fi
     uv pip uninstall pynvml || true
+    if [ "$engine:$engine_ver" = "sglang:token-space" ] && [ "$TEST_BUILD" -ne 1 ]; then
+        apply_te_fa4_compatibility
+    fi
 }
 
 #=======================DOCUMENTATION INSTALLER=======================

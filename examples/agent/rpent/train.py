@@ -37,7 +37,6 @@ from rlinf.workers.rollout.utils import get_rollout_backend_worker
 @output_redirector
 def main(cfg) -> None:
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
-    from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
     cfg = validate_cfg(cfg)
     get_logger().info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
@@ -94,6 +93,8 @@ def main(cfg) -> None:
     )
     critic = None
     if cfg.critic.use_critic_model:
+        from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
+
         critic = MAMegatronCritic.create_group(cfg, placement).launch(
             cluster,
             name=cfg.critic.group_name,
