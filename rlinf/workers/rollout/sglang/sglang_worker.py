@@ -18,6 +18,7 @@ import dataclasses
 import os
 import sys
 from typing import Any, Literal, Optional
+from uuid import uuid4
 
 import msgspec
 from omegaconf import DictConfig
@@ -59,6 +60,7 @@ _SERVER_ARGS_FIELDS = {
         else msgspec.structs.fields(ServerArgs)
     )
 }
+_COHORT_CLEANUP_TIMEOUT_S = 60
 
 
 class SGLangWorker(Worker):
@@ -228,6 +230,8 @@ class SGLangWorker(Worker):
             "max_mamba_cache_size",
             "chunked_prefill_size",
             "disable_radix_cache",
+            "enable_metrics",
+            "enable_cache_report",
         ):
             if name in self._cfg_rollout.sglang:
                 version_dependent_args[name] = self._cfg_rollout.sglang[name]
@@ -868,10 +872,18 @@ class SGLangWorker(Worker):
         prepare_multimodal: Optional[dict] = None,
         return_prompt_token_ids: bool = False,
         mm_token_expansion_start_len: Optional[int] = None,
+        cohort_id: Optional[str] = None,
     ):
         # Backstop for rollout_serverless's entry-rank gate; return instead
         # of raising because nobody awaits this task.
         if not self._is_model_instance_entry:
+            return
+        if cohort_id is not None and cohort_id in self._closed_generation_cohorts:
+            await output_channel.put(
+                {"error": "synchronous_oversample_drop"},
+                key=channel_key,
+                async_op=True,
+            ).async_wait()
             return
         final_sampling_params = self._sampling_params
         if sampling_params is not None and len(sampling_params) > 0:
@@ -903,19 +915,36 @@ class SGLangWorker(Worker):
                 return_logprob=self._return_logprobs,
                 **extra,
             )
-            result_dict = decode_generation_result(
-                result, return_logprobs=self._return_logprobs
-            )
-            result_dict.update(
-                version_start=version_start, version_end=self._weight_version
-            )
-        except Exception as error:
-            # The requester waits on this key; report the failure instead of hanging it.
-            self.log_error(f"generation failed for request {channel_key}: {error!r}")
+            if cohort_id is not None and cohort_id in self._closed_generation_cohorts:
+                # Native abort replies may omit prompt/output token metadata.
+                result_dict = {"error": "synchronous_oversample_drop"}
+            else:
+                result_dict = decode_generation_result(
+                    result, return_logprobs=self._return_logprobs
+                )
+                result_dict.update(
+                    version_start=version_start, version_end=self._weight_version
+                )
+        except asyncio.CancelledError:
+            if cohort_id is None or cohort_id not in self._closed_generation_cohorts:
+                raise
             await output_channel.put(
-                {"error": f"{type(error).__name__}: {error}"},
+                {"error": "synchronous_oversample_drop"},
                 key=channel_key,
                 async_op=True,
+            ).async_wait()
+            return
+        except Exception as error:
+            # The requester waits on this key; report the failure instead of hanging it.
+            if cohort_id is not None and cohort_id in self._closed_generation_cohorts:
+                result_dict = {"error": "synchronous_oversample_drop"}
+            else:
+                self.log_error(
+                    f"generation failed for request {channel_key}: {error!r}"
+                )
+                result_dict = {"error": f"{type(error).__name__}: {error}"}
+            await output_channel.put(
+                result_dict, key=channel_key, async_op=True
             ).async_wait()
             return
         await output_channel.put(
@@ -927,6 +956,10 @@ class SGLangWorker(Worker):
         if not self._is_model_instance_entry:
             return
         self._serverless_stopping = False
+        self._closed_generation_cohorts = set()
+        self._generation_cohorts = {}
+        self._generation_outputs = {}
+        self._cohort_fences = {}
         self._serverless_input_channel = input_channel
         self._serverless_request_key = (
             self._placement.rollout_model_instance_id(self._rank)
@@ -939,6 +972,9 @@ class SGLangWorker(Worker):
             ).async_wait()
             if request is None:
                 break
+            if "cohort_fence" in request:
+                self._cohort_fences[request["cohort_fence"]].set()
+                continue
             await self._dispatch_gate.wait()
             if self._serverless_stopping:
                 break
@@ -956,10 +992,83 @@ class SGLangWorker(Worker):
                     mm_token_expansion_start_len=request.get(
                         "mm_token_expansion_start_len"
                     ),
+                    cohort_id=request.get("cohort_id"),
                 )
             )
             self._inflight_generates.add(task)
+            self._generation_cohorts[task] = request.get("cohort_id")
+            self._generation_outputs[task] = (output_channel, request["channel_key"])
             task.add_done_callback(self._inflight_generates.discard)
+            task.add_done_callback(lambda done: self._generation_cohorts.pop(done))
+            task.add_done_callback(lambda done: self._generation_outputs.pop(done))
+
+    async def finish_generation_cohort(self, cohort_id: str) -> dict:
+        """Abort a synchronous cohort, reject late work and fence its input queue."""
+        if not self._is_model_instance_entry:
+            return {}
+        foreign = {
+            version
+            for task, version in self._generation_cohorts.items()
+            if not task.done() and version != cohort_id
+        }
+        if foreign:
+            raise RuntimeError(
+                f"Cannot abort cohort {cohort_id}: unrelated generation is active "
+                f"({foreign})."
+            )
+        self._closed_generation_cohorts.add(cohort_id)
+        await self._backend.abort_generation()
+        tasks = list(self._inflight_generates)
+        outputs = [self._generation_outputs[task] for task in tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result, (output, key) in zip(results, outputs, strict=True):
+                if isinstance(result, asyncio.CancelledError):
+                    # Cancellation before a coroutine's first instruction
+                    # bypasses generate_and_send's cancellation handler.
+                    await output.put(
+                        {"error": "synchronous_oversample_drop"},
+                        key=key,
+                        async_op=True,
+                    ).async_wait()
+                elif isinstance(result, BaseException):
+                    raise result
+        fence_id = uuid4().hex
+        fence = self._cohort_fences[fence_id] = asyncio.Event()
+        try:
+            await self._serverless_input_channel.put(
+                {"cohort_fence": fence_id},
+                key=self._serverless_request_key,
+                async_op=True,
+            ).async_wait()
+            await fence.wait()
+        finally:
+            del self._cohort_fences[fence_id]
+        tasks = list(self._inflight_generates)
+        if tasks:
+            await asyncio.gather(*tasks)
+        await self._backend.abort_generation()
+        deadline = asyncio.get_running_loop().time() + _COHORT_CLEANUP_TIMEOUT_S
+        state = await self._backend.get_running_state()
+        while state.num_running_reqs or state.num_queue_reqs:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"Cohort {cohort_id} did not drain: running={state.num_running_reqs}, "
+                    f"queued={state.num_queue_reqs}."
+                )
+            await asyncio.sleep(0.05)
+            state = await self._backend.get_running_state()
+        return {
+            "cohort_id": cohort_id,
+            "rank": self._rank,
+            "aborted": True,
+            "queue_fenced": True,
+            "inflight": len(self._inflight_generates),
+            "running": state.num_running_reqs,
+            "queued": state.num_queue_reqs,
+        }
 
     async def stop_serverless(self) -> None:
         """Cancel owned requests and release the channel consumer."""

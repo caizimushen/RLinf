@@ -1,0 +1,59 @@
+# Whole groups are selected after all eight episodes finish.
+defaults:
+  - train_qwen3.5_4b_episode_sync_oversample320
+  - _self_
+
+runner:
+  experiment_name: rpent-episode-qwen3.5-4b-sync-grpo
+  max_steps: 150
+  max_epochs: 150
+  save_interval: 10
+
+algorithm:
+  clip_ratio_high: 0.28
+  loss_scales: ["group_level", "agent_level", "turn_level"]
+  group_size: 8
+  adv_type: grpo_dynamic
+  advantage_mode: trajectory
+  # GRPO already normalizes within each group; skip a second batch whitening.
+  normalize_advantages: false
+  down_sampling:
+    do_down_sampling: false
+  sampling_params:
+    max_new_tokens: 16384
+
+data:
+  rollout_batch_size: 32
+  sampling_batch_size: 40
+
+agentloop:
+  max_turns: 50
+  minimum_output_tokens: 16384
+
+tools:
+  rpent:
+    episodes_per_worker: 10
+    training_image_prefetch_batches: 2
+    training_image_prefetch_bytes: 1073741824
+
+rollout:
+  env_vars:
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
+  gpu_memory_utilization: 0.55
+  sglang:
+    disable_fast_image_processor: true
+    image_processor_backend: pil
+    enable_token_space_processor: true
+    enable_token_space_preprocess_cache: true
+    token_space_preprocess_cache_dir: ???
+    token_space_preprocess_cache_trust_url: true
+    token_space_preprocess_cache_check_rate: 0.01
+
+actor:
+  megatron:
+    mbridge: true
+  lr_sched:
+    lr_decay_iters: 150
+
+critic:
+  use_critic_model: false

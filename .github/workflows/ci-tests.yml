@@ -211,6 +211,8 @@ jobs:
               - 'rlinf/runners/async_agent_ppo_runner.py'
               - 'examples/agent/rpent/checkpoint.py'
               - 'examples/agent/rpent/eval.py'
+              - 'examples/agent/rpent/train.py'
+              - 'examples/agent/rpent/replay_train.py'
               - 'examples/agent/rpent/config/**'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'

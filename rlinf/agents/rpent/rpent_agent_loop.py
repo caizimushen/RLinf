@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Original LIBERO and clean libero_rl planner episodes served by RLinf."""
+"""RPent planner episodes with token-preserving synchronous RLinf sampling."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
+import os
+import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -27,12 +30,11 @@ from uuid import uuid4
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from rlinf.agents.rpent.episode import Episode, RPentEpisodeError, merge_prefix_turns
+from rlinf.agents.rpent.episode import Episode, RPentEpisodeError, episode_output
 from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
     request_has_images,
 )
-from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
 from rlinf.agents.rpent.thinking_budget import (
     ThinkingBudget,
     serialized_thinking_processor,
@@ -51,7 +53,12 @@ from rlinf.workers.agent.openai_session_server import (
     chat_completion,
 )
 
-_RETRY_KINDS = ("env_setup", "process", "model_transport")
+_RETRY_KINDS = ("env_setup", "process", "model_transport", "tool_transport")
+# Exit status of an RPent episode whose environment or shared service did not
+# start (robots.rl.rl_episode.EXIT_SETUP_FAILED).
+_EXIT_SETUP_FAILED = 75
+# A stopped episode process gets this long to release its simulator.
+_STOP_GRACE_S = 60
 # The planner names this model in its requests; each worker serves one policy.
 _MODEL_NAME = "policy"
 # Closes the reasoning the generation prompt opened; the answer follows it.
@@ -72,10 +79,10 @@ def _episode_task(answer: list[str]) -> dict:
 class RPentAgentLoopWorker(MultiAgentLoopWorker):
     """Run RPent planner episodes and keep the turns they sample from the policy.
 
-    Each episode runs the selected ``robots.libero.rl_episode`` or
-    ``robots.libero_rl.rl_episode`` in its own process on
-    this worker's node, which hosts the LIBERO simulators. The planner runs
-    unchanged in that process and calls this worker's OpenAI endpoint, which
+    Each episode runs its configured planner entrypoint in a local process.
+    The current episode workflow delegates simulator/tools to a remote backend;
+    legacy entries keep their existing environment placement. The planner
+    calls this worker's OpenAI endpoint, which
     samples each request from the rollout engine. A request that extends the previous turn is rendered as the
     previous turn's sampled tokens plus the new messages, so consecutive turns
     can be merged into one training row. Only episodes with a task outcome are
@@ -117,9 +124,12 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         for slot in range(rpent.episodes_per_worker):
             index = self._rank + slot
             self._env_slots.put_nowait(rpent.env_gpus[index % len(rpent.env_gpus)])
-        self._episode_launcher = RPentEpisodeLauncher(cfg)
+        self._env_initializations = asyncio.Semaphore(
+            rpent.get("max_env_initializations_per_worker", 8)
+        )
         # Loaded when view_env first returns images.
         self._image_processor = None
+        self._candidate_episode_paths: dict[tuple[str, int], list[Path]] = {}
         # Episode processes run on this node and reach the endpoint locally.
         self._model_server = OpenAISessionServer(
             self._complete,
@@ -177,9 +187,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             )
             base_url = self._model_server.open(episode.episode_id, episode)
             try:
-                outcome = await self._episode_launcher.run(
-                    episode, self._planner_options(base_url), gpu
-                )
+                outcome = await self._run_rpent(episode, base_url, gpu)
             finally:
                 error = await self._model_server.close(episode.episode_id)
             if error is not None:
@@ -189,6 +197,192 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             self._env_slots.put_nowait(gpu)
         self._check_planner_done(episode, outcome)
         return self._episode_output(episode, outcome)
+
+    async def _run_rpent(self, episode: Episode, base_url: str, gpu: int) -> dict:
+        """Run the episode's RPent process and return the outcome it wrote."""
+        rpent = self.cfg.tools.rpent
+        output = Path(rpent.output_dir) / episode.episode_id
+        output.mkdir(parents=True)
+        candidate = self.rollout_candidate()
+        if candidate is not None:
+            key = (candidate["cohort_id"], candidate["candidate_id"])
+            self._candidate_episode_paths.setdefault(key, []).append(output)
+            (output / "sampling-candidate.json").write_text(
+                json.dumps({**candidate, "episode_id": episode.episode_id}) + "\n"
+            )
+        request = {"task": episode.task, "planner": self._planner_options(base_url)}
+        (output / "request.json").write_text(json.dumps(request))
+        command = self._rpent_command(output, gpu)
+        log = output / "episode.log"
+        with log.open("wb") as log_file:
+            await self._env_initializations.acquire()
+            start_task = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=log_file,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env={
+                        **self._episode_env(gpu),
+                        **(
+                            {"RPENT_REMOTE_OWNER_ID": episode.episode_id}
+                            if candidate is not None
+                            else {}
+                        ),
+                    },
+                )
+            )
+            try:
+                process = await asyncio.shield(start_task)
+            except asyncio.CancelledError:
+                try:
+                    process = await start_task
+                    await _stop(process)
+                finally:
+                    self._env_initializations.release()
+                raise
+            except BaseException:
+                self._env_initializations.release()
+                raise
+            startup = asyncio.create_task(
+                self._watch_environment_startup(process, output)
+            )
+            try:
+                returncode = await asyncio.wait_for(
+                    process.wait(), rpent.process_timeout_s
+                )
+            except asyncio.TimeoutError:
+                raise RPentEpisodeError(
+                    f"RPent episode {episode.episode_id} ran past "
+                    f"tools.rpent.process_timeout_s; see {log}",
+                    kind="process",
+                ) from None
+            finally:
+                try:
+                    await _stop(process)
+                    if candidate is not None:
+                        (output / "sampling-process-cleanup.json").write_text(
+                            json.dumps(
+                                {
+                                    "process_exited": process.returncode is not None,
+                                    "returncode": process.returncode,
+                                }
+                            )
+                            + "\n"
+                        )
+                finally:
+                    startup.cancel()
+                    await asyncio.gather(startup, return_exceptions=True)
+        if returncode == _EXIT_SETUP_FAILED:
+            raise RPentEpisodeError(
+                f"RPent episode {episode.episode_id} did not start; see {log}",
+                kind="env_setup",
+            )
+        if returncode < 0:
+            raise RPentEpisodeError(
+                f"RPent episode {episode.episode_id} was stopped by signal "
+                f"{-returncode}; see {log}",
+                kind="process",
+            )
+        if returncode != 0:
+            raise RPentEpisodeError(
+                f"RPent episode {episode.episode_id} failed with exit status "
+                f"{returncode}; see {log}",
+                kind="process",
+            )
+        outcome = json.loads((output / "outcome.json").read_text())
+        keep = rpent.keep_episodes == "all" or (
+            rpent.keep_episodes == "failures" and not outcome["success"]
+        )
+        if not keep and candidate is None:
+            shutil.rmtree(output)
+        return outcome
+
+    async def finalize_rollout_candidates(self, records: list[dict]) -> None:
+        """Keep each attempt and its disposition, including cancelled partial traces."""
+        cohort_id = self._candidate_cohort["id"]
+        paths_by_candidate = {
+            record["candidate_id"]: self._candidate_episode_paths.get(
+                (cohort_id, record["candidate_id"]), []
+            )
+            for record in records
+        }
+        all_paths = [path for paths in paths_by_candidate.values() for path in paths]
+        endpoint = self.cfg.tools.rpent.get("remote_toolkit_endpoint")
+        receipt = None
+        cleanup_error = None
+        try:
+            if endpoint is not None and all_paths:
+                receipt = await self._release_remote_candidates(
+                    cohort_id, endpoint, [path.name for path in all_paths]
+                )
+        except BaseException as error:
+            cleanup_error = repr(error)
+            raise
+        finally:
+            for record in records:
+                paths = paths_by_candidate[record["candidate_id"]]
+                record["episode_paths"] = [str(path) for path in paths]
+                record["remote_cleanup"] = receipt
+                record["cleanup_complete"] = cleanup_error is None
+                record["cleanup_error"] = cleanup_error
+                for path in paths:
+                    (path / "sampling-selection.json").write_text(
+                        json.dumps({**record, "cohort_id": cohort_id}, indent=2) + "\n"
+                    )
+                if cleanup_error is None:
+                    self._candidate_episode_paths.pop(
+                        (cohort_id, record["candidate_id"]), None
+                    )
+
+    async def _release_remote_candidates(
+        self, cohort_id: str, endpoint: str, owner_ids: list[str]
+    ) -> dict:
+        """Use the configured RPent runtime to tombstone and release exact attempts."""
+        output = Path(self.cfg.tools.rpent.output_dir) / "sampling"
+        output.mkdir(parents=True, exist_ok=True)
+        request = output / f"{cohort_id}-worker-{self._rank}-owners.json"
+        receipt = request.with_name(request.stem + "-receipt.json")
+        log = request.with_suffix(".log")
+        request.write_text(json.dumps(owner_ids) + "\n")
+        code = (
+            "import json,sys; from pathlib import Path; "
+            "from robots.rl.remote import cancel_remote_owners; "
+            "result=cancel_remote_owners(sys.argv[1],"
+            "json.loads(Path(sys.argv[2]).read_text())); "
+            "Path(sys.argv[3]).write_text(json.dumps(result))"
+        )
+        with log.open("wb") as log_file:
+            process = await asyncio.create_subprocess_exec(
+                self.cfg.tools.rpent.python,
+                "-c",
+                code,
+                endpoint,
+                str(request),
+                str(receipt),
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._episode_env(self.cfg.tools.rpent.env_gpus[0]),
+            )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=240)
+            finally:
+                await _stop(process)
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"Remote candidate cleanup failed with {process.returncode}; see {log}."
+            )
+        result = json.loads(receipt.read_text())
+        if result["owner_ids"] != owner_ids or not result["cleanup_complete"]:
+            raise RuntimeError(f"Remote candidate cleanup was not verified: {receipt}.")
+        return result
+
+    async def _watch_environment_startup(self, process, output: Path) -> None:
+        """Release a cold-start permit after reset, process exit, or cancellation."""
+        try:
+            while process.returncode is None and not (output / "states.json").is_file():
+                await asyncio.sleep(0.5)
+        finally:
+            self._env_initializations.release()
 
     def _planner_options(self, base_url: str) -> dict:
         """Planner options of an episode whose policy is served at ``base_url``."""
@@ -205,23 +399,124 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             if compaction is None
             else OmegaConf.to_container(compaction, resolve=True),
         }
-        if self.cfg.tools.rpent.get("workflow", "libero") == "libero_rl":
+        workflow = self.cfg.tools.rpent.get("workflow", "libero")
+        if workflow in {"libero_rl", "episode"}:
             options.update(
                 observation_mode="adaptive", prompt=agentloop.get("prompt", "simple")
             )
+            if workflow == "episode":
+                sampling = self.cfg.algorithm.sampling_params
+                options.update(
+                    thinking=agentloop.chat_template_kwargs.enable_thinking,
+                    reasoning_effort="none",
+                    sampling_params={
+                        name: sampling[name]
+                        for name in (
+                            "temperature",
+                            "top_p",
+                            "top_k",
+                            "min_p",
+                            "presence_penalty",
+                            "repetition_penalty",
+                        )
+                    },
+                )
         else:
             options["no_images"] = True
         return options
+
+    def _episode_env(self, gpu: int) -> dict[str, str]:
+        """Environment of an episode process assigned to ``gpu``.
+
+        Agent workers hold every GPU, so the worker's own environment names
+        GPU 0 as the render device. The episode process picks its device from
+        ``--cuda-device`` instead, and ``configure_egl_device`` only overrides
+        an inherited value when it is unset, so the inherited one has to go.
+        """
+        env = dict(os.environ)
+        env.pop("MUJOCO_EGL_DEVICE_ID", None)
+        env.pop("EGL_DEVICE_ID", None)
+        config_path = self.cfg.tools.rpent.get("libero_config_path")
+        if config_path is not None:
+            env["LIBERO_CONFIG_PATH"] = str(config_path)
+        repo_path = self.cfg.tools.rpent.get("repo_path")
+        if repo_path is not None:
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(repo_path), env.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep)
+        return env
+
+    def _rpent_command(self, output: Path, gpu: int) -> list[str]:
+        """Command line of an episode process writing to ``output``."""
+        rpent = self.cfg.tools.rpent
+        workflow = rpent.get("workflow", "libero")
+        command = [
+            rpent.python,
+            "-m",
+            rpent.get("entrypoint", f"robots.{workflow}.rl_episode"),
+            "--output-dir",
+            str(output),
+            "--request",
+            str(output / "request.json"),
+        ]
+        if workflow in {"libero_rl", "episode"}:
+            command += [
+                "--observation-mode",
+                "adaptive",
+                "--prompt",
+                self.cfg.agentloop.get("prompt", "simple"),
+            ]
+            if rpent.get("remote_toolkit_endpoint") is not None:
+                command += ["--remote-toolkit-endpoint", rpent.remote_toolkit_endpoint]
+            elif rpent.get("sam3_endpoint") is not None:
+                command += ["--sam3-endpoint", rpent.sam3_endpoint]
+            if rpent.get("libero_type") is not None:
+                command += ["--libero-type", rpent.libero_type]
+            if workflow == "episode":
+                command += [
+                    "--workflow",
+                    workflow,
+                    "--image_size",
+                    str(rpent.image_size),
+                ]
+                for name in (
+                    "action_mode",
+                    "max_actions_per_call",
+                    "perception_mode",
+                    "reasoning_history",
+                    "image_history",
+                ):
+                    command += ["--" + name.replace("_", "-"), str(rpent[name])]
+        else:
+            command += [
+                "--vla-endpoint",
+                rpent.vla_endpoint,
+                "--sam3-endpoint",
+                rpent.sam3_endpoint,
+                "--libero-type",
+                rpent.libero_type,
+            ]
+        command += [
+            "--max-episode-steps",
+            str(rpent.max_episode_steps),
+            "--cuda-device",
+            str(gpu),
+            "--tokenizer-path",
+            self.cfg.rollout.model.model_path,
+        ]
+        if workflow == "libero" and rpent.get("frozen_memory_dir") is not None:
+            command += ["--frozen-memory-dir", rpent.frozen_memory_dir]
+        return command
 
     @staticmethod
     def _check_planner_done(episode: Episode, status: dict) -> None:
         """Reject a planner exit that has no task outcome."""
         if status["terminal"]:
             return
-        if status.get("error_kind") == "model_transport":
+        if status.get("error_kind") in {"model_transport", "tool_transport"}:
             raise RPentEpisodeError(
-                f"RPent model request failed: {status.get('error')}",
-                kind="model_transport",
+                f"RPent service request failed: {status.get('error')}",
+                kind=status["error_kind"],
             )
         # Unknown planner failures must not select a replacement trajectory.
         raise RuntimeError(
@@ -301,9 +596,12 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
     async def _complete(self, episode: Episode, request: dict) -> dict:
         """Sample one planner request, record the turn, and return its completion."""
         turn_idx = len(episode.turns)
+        started = time.perf_counter()
+        started_at = time.time()
         prompt_ids, images, image_grid_thw = await self._render_request(
             episode, request
         )
+        rendered_at = time.perf_counter()
         sampling_params = {
             "max_new_tokens": self._output_budget(len(prompt_ids)),
             # SGLang skips tokenizer initialization for token-ID requests,
@@ -330,7 +628,22 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         generated = await self.generate(
             prompt_ids, sampling_params=sampling_params, **extra
         )
+        generated_at = time.perf_counter()
         self._check_generation(generated, prompt_ids)
+        if self.cfg.tools.rpent.get("workflow") == "episode" and self.cfg.runner.get(
+            "synchronous", False
+        ):
+            version = generated.get("version_start")
+            if version is None or version != generated.get("version_end"):
+                raise ValueError(
+                    "Synchronous RPent requires one installed weight version throughout a generation."
+                )
+            if episode.weight_version is not None and episode.weight_version != version:
+                raise ValueError(
+                    "The policy version changed during a synchronous RPent episode."
+                )
+            episode.weight_version = version
+            generated["weight_versions"] = [version] * len(generated["output_ids"])
         response_ids = generated["output_ids"]
         response_text, calls, message = await self._parse_response(
             response_ids, request.get("tools"), turn_idx
@@ -356,10 +669,67 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 response_logprobs=generated.get("logprobs"),
                 response_weight_versions=generated.get("weight_versions"),
                 response_images=image_grid_thw,
+                version_start=generated.get("version_start")
+                if self.cfg.tools.rpent.get("workflow") == "episode"
+                else None,
+                version_end=generated.get("version_end")
+                if self.cfg.tools.rpent.get("workflow") == "episode"
+                else None,
                 is_end=generated["finish_reason"] == "stop",
                 extra_fields=extra_fields,
             )
         )
+        if self.cfg.tools.rpent.get("workflow") == "episode":
+            media = image_grid_thw or {}
+            grid = media.get("image_grid_thw")
+            if isinstance(grid, torch.Tensor):
+                grid = grid.tolist()
+            image_hashes = (
+                [reference["sha256"] for reference in media["image_refs"]]
+                if "image_refs" in media
+                else [hashlib.sha256(image).hexdigest() for image in images]
+            )
+            audit = {
+                "episode_id": episode.episode_id,
+                "task": episode.task,
+                "turn_id": turn_idx,
+                "chain_id": episode.history.chain_id,
+                "started_at": started_at,
+                "finished_at": time.time(),
+                "input_ids": prompt_ids,
+                "output_ids": response_ids,
+                "response_mask": episode.turns[-1].response_mask
+                or [1] * len(response_ids),
+                "behavior_logprobs": generated.get("logprobs"),
+                "weight_version_start": generated.get("version_start"),
+                "weight_version_end": generated.get("version_end"),
+                "token_weight_versions": generated.get("weight_versions"),
+                "image_sha256": image_hashes,
+                "served_prompt_ids_match": generated.get("prompt_token_ids")
+                == prompt_ids,
+                "multimodal_contract": {
+                    **media,
+                    "image_grid_thw": grid,
+                }
+                if media.get("format")
+                else None,
+                "multimodal_format": media.get("format"),
+                "processor_fingerprint": media.get("processor_fingerprint"),
+                "image_grid_thw": grid,
+                "finish_reason": generated["finish_reason"],
+                "tool_names": extra_fields["tool_names"],
+                "render_seconds": rendered_at - started,
+                "generation_seconds": generated_at - rendered_at,
+                "parse_seconds": time.perf_counter() - generated_at,
+            }
+            directory = (
+                Path(self.cfg.tools.rpent.output_dir)
+                / episode.episode_id
+                / "training_audit"
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"turn-{turn_idx:05d}.json"
+            await asyncio.to_thread(path.write_text, json.dumps(audit))
         if generated["finish_reason"] == "length":
             finish_reason = "length"
         else:
@@ -464,32 +834,16 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     def _episode_output(self, episode: Episode, status: dict) -> MultiAgentLoopOutput:
         """Score a finished episode's turns with its task outcome."""
-        success = status["success"]
-        for turn in episode.turns:
-            turn.reward_score = float(success)
-        turns = episode.turns
-        if self.cfg.agentloop.merge_prefix_turns:
-            turns = merge_prefix_turns(
-                turns,
-                self.cfg.agentloop.get(
-                    "max_scored_tokens",
-                    self.cfg.algorithm.sampling_params.max_new_tokens,
-                ),
-            )
-        return MultiAgentLoopOutput(
-            single_turn_outputs=turns,
-            extra_fields={
-                "success": success,
-                "init_state_id": status["init_state_id"],
-                "memory_entries": status["memory_entries"],
-                "truncated": status["truncated"],
-                "task": episode.task,
-                "terminal": status["terminal"],
-                "termination_reason": status["termination_reason"],
-                "episode_id": episode.episode_id,
-                "elapsed_s": time.monotonic() - episode.started,
-                "turns": len(episode.turns),
-            },
+        return episode_output(
+            episode.turns,
+            task=episode.task,
+            episode_id=episode.episode_id,
+            status=status,
+            elapsed_s=time.monotonic() - episode.started,
+            merge=self.cfg.agentloop.merge_prefix_turns,
+            max_scored_tokens=self.cfg.agentloop.get(
+                "max_scored_tokens", self.cfg.algorithm.sampling_params.max_new_tokens
+            ),
         )
 
     def gen_extra_fields(self, task_results, answer):
@@ -544,3 +898,15 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 message + f"; stop threshold is {_MIN_RETRIED_EPISODES} episodes"
             )
         return metrics
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    """Stop an episode process, giving it time to release its simulator."""
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), _STOP_GRACE_S)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()

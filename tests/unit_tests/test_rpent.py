@@ -97,6 +97,115 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
     assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
 
 
+def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(tmp_path):
+    import hashlib
+
+    from rlinf.agents.rpent.replay import SavedRPentBatch
+
+    def write(path, value):
+        path.write_text(json.dumps(value))
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    task = {"task_id": 3, "init_state_id": 9}
+    records = []
+    for candidate in (0, 1):
+        directory = tmp_path / f"episode-{candidate}"
+        (directory / "training_audit").mkdir(parents=True)
+        (directory / "training_images").mkdir()
+        image = b"saved-image"
+        digest = hashlib.sha256(image).hexdigest()
+        path = directory / "training_images" / digest
+        path.write_bytes(image)
+        request_hash = write(directory / "request.json", {"task": task})
+        status = {
+            "terminal": True,
+            "success": bool(candidate),
+            "init_state_id": 9,
+            "memory_entries": [],
+            "truncated": False,
+            "termination_reason": "planner_completed",
+        }
+        outcome_hash = write(directory / "outcome.json", status)
+        contract = {
+            "format": "sglang-token-space-v1",
+            "image_refs": [{"path": str(path), "sha256": digest}],
+            "image_grid_thw": [[1, 2, 2]],
+            "num_images": 1,
+            "processor_fingerprint": "saved-processor",
+            "prompt_token_ids": [10, 11],
+            "image_spans": [[1, 2]],
+            "pixel_values_sha256": "saved-pixels",
+            "mrope_sha256": "saved-positions",
+        }
+        turn = {
+            "episode_id": directory.name,
+            "task": task,
+            "turn_id": 0,
+            "chain_id": 0,
+            "input_ids": [10, 11],
+            "output_ids": [20 + candidate],
+            "response_mask": [1],
+            "behavior_logprobs": [-0.25 - candidate],
+            "token_weight_versions": [0],
+            "weight_version_start": 0,
+            "weight_version_end": 0,
+            "finish_reason": "stop",
+            "tool_names": [],
+            "image_sha256": [digest],
+            "image_grid_thw": [[1, 2, 2]],
+            "multimodal_contract": contract,
+        }
+        turn_hash = write(directory / "training_audit/turn-00000.json", turn)
+        records.append(
+            {
+                "candidate_id": candidate,
+                "episode_id": directory.name,
+                "request_sha256": request_hash,
+                "outcome_sha256": outcome_hash,
+                "success": bool(candidate),
+                "turns": [{"file": "turn-00000.json", "sha256": turn_hash}],
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    write(
+        manifest,
+        {
+            "passed": True,
+            "episodes": 2,
+            "weight_versions": [0],
+            "policy_files": {"config.json": "policy-hash"},
+            "records": records,
+        },
+    )
+    saved = SavedRPentBatch(tmp_path, manifest, 0)
+    assert len(saved) == 2
+    outputs = [
+        saved.load_episode(
+            task,
+            candidate_id=i,
+            merge_prefix=True,
+            max_scored_tokens=8,
+            token_space=True,
+        )
+        for i in (0, 1)
+    ]
+    assert [o.single_turn_outputs[0].response_ids for o in outputs] == [[20], [21]]
+    assert [o.single_turn_outputs[0].reward_score for o in outputs] == [0.0, 1.0]
+    for output in outputs:
+        payload = output.single_turn_outputs[0].response_images
+        assert payload["processor_fingerprint"] == "saved-processor"
+        assert payload["mrope_sha256"] == "saved-positions"
+        assert payload["image_grid_thw"].tolist() == [[1, 2, 2]]
+    with pytest.raises(ValueError, match="different task"):
+        saved.load_episode(
+            {"task_id": 4},
+            candidate_id=0,
+            merge_prefix=True,
+            max_scored_tokens=8,
+            token_space=True,
+        )
+
+
 # Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
 # worker's policy endpoint and writes the outcome, as the real process does.
 FAKE_EPISODE = """
@@ -850,3 +959,57 @@ Path(sys.argv[2]).write_text(json.dumps({"hits": len(hits), "digests": {
     assert actual["digests"] == {
         key: tensor_digest(value) for key, value in expected.items()
     }
+
+
+def test_tokenspace_grouped_grpo_keeps_native_loss_scales_without_a_critic():
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        overrides=[
+            "rollout.sglang.token_space_preprocess_cache_dir=/test/cache",
+            "tools.rpent.repo_path=/test/rpent",
+            "tools.rpent.remote_toolkit_endpoint=http://127.0.0.1:28490",
+        ],
+        config_name="train_qwen3.5_4b_episode_sync_grpo",
+    )
+    validate_rpent_cfg(cfg)
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert list(cfg.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert cfg.algorithm.group_size == 8
+    assert cfg.data.rollout_batch_size == 32
+    assert cfg.data.sampling_batch_size == 40
+    assert not cfg.critic.use_critic_model
+    assert cfg.actor.megatron.mbridge
+    assert cfg.tools.rpent.entrypoint == "robots.rl.rl_episode"
+
+
+def test_grpo_recipe_accepts_token_space_without_critic_and_hierarchical_scales(
+    tmp_path,
+):
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        config_name="train_qwen3.5_4b_episode_sync_grpo",
+        overrides=[
+            "tools.rpent.repo_path=/test/rpent",
+            "tools.rpent.remote_toolkit_endpoint=http://127.0.0.1:28490",
+            f"rollout.sglang.token_space_preprocess_cache_dir={tmp_path}",
+        ],
+    )
+    validated = validate_rpent_cfg(cfg)
+    assert not validated.critic.use_critic_model
+    assert validated.algorithm.clip_ratio_high == 0.28
+    assert list(validated.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert (validated.data.rollout_batch_size, validated.data.sampling_batch_size) == (
+        32,
+        40,
+    )
+    assert validated.algorithm.group_size == 8

@@ -27,6 +27,7 @@ except ImportError:
     # sglang 0.5.2/0.5.4 lack this symbol; these values are stable across versions.
     GPU_MEMORY_ALL_TYPES = ["weights", "kv_cache", "cuda_graph"]
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
@@ -79,7 +80,7 @@ class Scheduler(_Scheduler):
     A Scheduler is a Task that manages the TP worker, and performs necessary weight synchronization with actor and weight offloading.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, server_args, *args, **kwargs):
         # An empty dict is paused; None permits requests to enter the scheduler.
         self._rlinf_parked = None
         self._rlinf_weight_version = None
@@ -87,7 +88,12 @@ class Scheduler(_Scheduler):
         self._rlinf_retractions = 0
         # Must run before super().__init__, which builds the model.
         patch_glm4_moe_lite_shared_expert_tp1()
-        super().__init__(*args, **kwargs)
+        if server_args.device in ("cuda", "hip"):
+            from triton.runtime import driver
+
+            # Driver discovery must finish before model setup captures CUDA graphs.
+            _ = driver.active
+        super().__init__(server_args, *args, **kwargs)
         if not hasattr(self, "tp_rank"):
             from sglang.srt.runtime_context import get_parallel
 
@@ -102,6 +108,8 @@ class Scheduler(_Scheduler):
             (TaskMethodInput, self.run_task_method),
             (SyncHFWeightInput, self.sync_hf_weight),
             (AbortGenerationInput, self.abort_generation),
+            (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+            (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
         ]
         if isinstance(self._request_dispatcher._mapping, dict):
             for _ty, _fn in _extra_req_mapping:
@@ -162,7 +170,9 @@ class Scheduler(_Scheduler):
         for tag in requested_tags:
             self.offloaded_tags[tag] = True
         self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
-        result = super().release_memory_occupation(recv_req)
+        result = getattr(self, "weight_updater", super()).release_memory_occupation(
+            recv_req
+        )
         return result
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -178,7 +188,9 @@ class Scheduler(_Scheduler):
         for tag in requested_tags:
             self.offloaded_tags[tag] = False
         self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
-        result = super().resume_memory_occupation(recv_req)
+        result = getattr(self, "weight_updater", super()).resume_memory_occupation(
+            recv_req
+        )
         if self.weight_reload == "cpu":
             model = self.tp_worker.worker.model_runner.model
             model.load_state_dict(self.cpu_state_dict)
@@ -550,21 +562,19 @@ class Scheduler(_Scheduler):
         return TaskMethodOutput(method_name=obj.method_name, result=result)
 
     def abort_generation(self, recv_req: AbortGenerationInput):
-        # clear waiting reqs
-        waiting_reqs = []
-        # waiting_reqs.append(self.waiting_queue)
-        for req in self.waiting_queue:
-            req.to_abort = True
-
-        # abort every running req with no kvcache
-        running_reqs = []
-        running_reqs.append(self.running_batch.reqs)
-        for req in self.running_batch.reqs:
-            req.to_abort = True
-        res = AbortGenerationOutput(
-            waiting_reqs=waiting_reqs, running_reqs=running_reqs
-        )
-        return res
+        """Cancel through the native scheduler and acknowledge only request IDs."""
+        waiting_ids = [req.rid for req in self.waiting_queue]
+        running = list(self.running_batch.reqs)
+        current = getattr(self, "cur_batch", None)
+        if current is not None and current is not self.running_batch:
+            running.extend(current.reqs)
+        running_ids = list(dict.fromkeys(req.rid for req in running))
+        # Native abort handles queued, chunked-prefill and running requests,
+        # including their KV/Mamba release and tokenizer notifications.
+        self.abort_request(AbortReq(abort_all=True))
+        # Req contains process-local locks in recent SGLang versions. Sending
+        # it through the scheduler's ZMQ response crashes the model server.
+        return AbortGenerationOutput(waiting_reqs=waiting_ids, running_reqs=running_ids)
 
     def init_rlinf_worker(
         self,

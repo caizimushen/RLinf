@@ -2262,6 +2262,56 @@ def test_rpent_two_model_nodes_share_all_sixteen_gpus():
     )
 
 
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_model_parallel_components_keep_selected_node_environment(evaluation):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    from rlinf.utils.placement import ModelParallelEvalComponentPlacement
+
+    config_dir = Path(__file__).parents[2] / "examples/agent/rpent/config"
+    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+        cfg = compose(config_name="train_qwen3.5_4b_episode_sync_grpo")
+    cluster = create_fake_cluster(4, 8, extra_group_mapping={"training": [0, 1, 2, 3]})
+    group = cluster.get_node_group("training")
+    group.env_configs = [
+        NodeGroupEnvConfig(
+            node_ranks=[0, 1, 2, 3],
+            env_vars=OmegaConf.create([{"MODEL_ENV": "training"}]),
+            python_interpreter_path="/opt/training/bin/python",
+        )
+    ]
+    for role in cfg.cluster.component_placement:
+        cfg.cluster.component_placement[role] = {
+            "node_group": "training",
+            "placement": "0-31",
+        }
+    placement_cls = (
+        ModelParallelEvalComponentPlacement
+        if evaluation
+        else ModelParallelComponentPlacement
+    )
+    placement = placement_cls(cfg, cluster)
+    roles = (
+        ["rollout", "reward"]
+        if evaluation
+        else ["actor", "rollout", "reward", "critic", "agentloop"]
+    )
+    for role in roles:
+        workers = placement.get_strategy(role).get_placement(cluster)
+        assert {worker.cluster_node_rank for worker in workers} == {0, 1, 2, 3}
+        for worker in workers:
+            selected = cluster.get_node_group(worker.node_group_label)
+            assert (
+                selected.get_node_python_interpreter_path(worker.cluster_node_rank)
+                == "/opt/training/bin/python"
+            )
+            assert selected.get_node_env_vars(worker.cluster_node_rank) == {
+                "MODEL_ENV": "training"
+            }
+
+
 class TestSearchr1AsyncAdmissionCfg:
     """validate_searchr1_cfg: async admission config (disaggregated
     placement, rollout_buffer, agentloop.task_name) and the rejection of

@@ -1,0 +1,19 @@
+# Training-only validation of one saved complete batch; never samples a policy.
+defaults:
+  - train_qwen3.5_4b_episode_sync_ppo
+  - _self_
+
+runner:
+  experiment_name: rpent-saved-batch-replay
+  max_steps: 1
+  max_epochs: 1
+  save_interval: 1
+  resume_dir: null
+
+data:
+  sampling_batch_size: 256
+
+replay:
+  source_dir: ???
+  manifest: ???
+  expected_version: 0

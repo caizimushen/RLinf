@@ -714,6 +714,8 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
 
 def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
+    if "data" in cfg and "sampling_batch_size" in cfg.data:
+        sampling_batch_size(cfg)
 
     with open_dict(cfg):
         cfg.mcore_gpt = cfg.get("mcore_gpt", True)
@@ -2147,6 +2149,34 @@ def validate_qwen_vl_chunked_cfg(cfg) -> int:
             "Qwen-VL chunked scoring requires a finite positive temperature"
         )
     return size
+
+
+def sampling_batch_size(cfg: DictConfig) -> int:
+    """Return the candidate count without changing the effective learner batch."""
+    effective = cfg.data.rollout_batch_size
+    candidates = cfg.data.get("sampling_batch_size", effective)
+    if type(candidates) is not int or candidates < effective:
+        raise ValueError(
+            "data.sampling_batch_size must be an integer >= "
+            f"data.rollout_batch_size={effective}, got {candidates!r}."
+        )
+    if candidates == effective:
+        return candidates
+    if cfg.runner.task_type != "reasoning" or not cfg.runner.get("synchronous", False):
+        raise ValueError(
+            "Oversampling requires synchronous agent PPO; asynchronous and "
+            "evaluation runs must use sampling_batch_size=rollout_batch_size."
+        )
+    if (
+        cfg.algorithm.get("max_num_gen_batches", 1) != 1
+        or not cfg.agentloop.get("is_dynamic_rollout_batch", False)
+        or cfg.rollout.rollout_backend != "sglang"
+    ):
+        raise ValueError(
+            "Synchronous oversampling requires "
+            "max_num_gen_batches=1, a multi-turn agent loop and SGLang rollout."
+        )
+    return candidates
 
 
 def validate_agent_ppo_cfg(cfg: DictConfig, task: str) -> None:

@@ -1208,6 +1208,9 @@ def megatron_cpu(monkeypatch, tmp_path):
         worker.cfg = OmegaConf.create(
             {
                 "runner": {"task_type": "reasoning"},
+                "rollout": {"model": {"model_path": "unused-no-images"}},
+                "tools": {},
+                "critic": {},
                 "algorithm": {
                     "loss_type": "actor",
                     "use_valid_token_scale": valid_token_scale,
@@ -1217,6 +1220,9 @@ def megatron_cpu(monkeypatch, tmp_path):
             }
         )
         worker.transformer_config = SimpleNamespace(sequence_parallel=False)
+        worker.lm_head_chunk_size = 0
+        worker.response_only_logits = False
+        worker.scoring_forward = None
         worker.return_loss = True
         worker.loss_agg_func = masked_mean
         worker.calculate_entropy = False
@@ -1228,7 +1234,9 @@ def megatron_cpu(monkeypatch, tmp_path):
         return worker
 
     try:
-        yield make_worker, parallel_state
+        # Checkpoint conversion disables grad mode; these are training forwards.
+        with torch.enable_grad():
+            yield make_worker, parallel_state
     finally:
         torch.distributed.destroy_process_group()
 
