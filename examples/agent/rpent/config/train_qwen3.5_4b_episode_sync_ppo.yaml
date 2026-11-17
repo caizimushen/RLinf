@@ -48,6 +48,7 @@ agentloop:
 tools:
   rpent:
     workflow: episode
+    world_cord: base
     entrypoint: robots.rl.rl_episode
     repo_path: ???
     remote_toolkit_endpoint: ???

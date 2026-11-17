@@ -319,3 +319,19 @@ TensorBoard 记录 optimizer loss、梯度范数、学习率、采样成功率�
 episode 训练默认关闭完整 HTTP 请求、响应和压缩前后输入的抓取。排查 planner 传输问题时设置 ``tools.rpent.record_api_trace=true``；直接运行 RPent 时使用 ``--record-api-trace``。开关不改变 prompt、压缩决策、token mask 或训练记录。
 
 分别报告任务失败、基础设施错误、选入和取消组构成、token/turn 成本，以及准确的源码和依赖版本。60 条训练池回归不能当作独立测试集上的结果。
+
+纯图像控制
+----------
+
+pear 配置在每次动作后提供双相机 RGB 和实测机器人状态，沿用 GRPO 算法及每批 32 组、每组 8 条、超发 40 组的设置。仅提供 ``move_to`` 和 ``set_gripper`` 两个工具，``move_to`` 使用绝对位姿。环境判定任务成功或预算耗尽后，episode 自动结束。非法动作回复按正常失败处理，不再请求模型纠正。
+
+沿用上文的环境、完整多模态 planner checkpoint、任务清单和部署配置。启动相同版本的 RPent backend；仅运行 pear 的 backend 不需要 SAM3 端点或权重。在 Ray head 启动：
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_pear_sync_grpo \
+     --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+配置默认 ``tools.rpent.world_cord=general``：原点在安装基座中心，x 向前、y 向左、z 向上，抓取 TCP 是两指指垫中心的实测中点，初始观测给出桌面相对基座的高度。现有 LIBERO 感知工作流也会按此设置返回几何坐标。设为 ``tools.rpent.world_cord=base`` 可保留仿真世界坐标和原控制点。
+
+thinking 默认开启。添加 ``agentloop.chat_template_kwargs.enable_thinking=false`` 后，要求模型直接调用工具，不输出推理文本。RPent CLI 对应 ``--reasoning`` 和 ``--no-reasoning``。切换工作流或坐标系时，使用独立运行目录，并固定源码版本；原有 SFT 工作流仍保留默认行为。

@@ -292,11 +292,11 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             else OmegaConf.to_container(compaction, resolve=True),
         }
         workflow = self.cfg.tools.rpent.get("workflow", "libero")
-        if workflow in {"libero_rl", "episode"}:
+        if workflow in {"libero_rl", "episode", "pear"}:
             options.update(
                 observation_mode="adaptive", prompt=agentloop.get("prompt", "simple")
             )
-            if workflow == "episode":
+            if workflow in {"episode", "pear"}:
                 sampling = self.cfg.algorithm.sampling_params
                 options.update(
                     thinking=agentloop.chat_template_kwargs.enable_thinking,
@@ -439,9 +439,10 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         )
         generated_at = time.perf_counter()
         self._check_generation(generated, prompt_ids)
-        if self.cfg.tools.rpent.get("workflow") == "episode" and self.cfg.runner.get(
-            "synchronous", False
-        ):
+        if self.cfg.tools.rpent.get("workflow") in {
+            "episode",
+            "pear",
+        } and self.cfg.runner.get("synchronous", False):
             version = generated.get("version_start")
             if version is None or version != generated.get("version_end"):
                 raise ValueError(
@@ -479,16 +480,16 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 response_weight_versions=generated.get("weight_versions"),
                 response_images=image_grid_thw,
                 version_start=generated.get("version_start")
-                if self.cfg.tools.rpent.get("workflow") == "episode"
+                if self.cfg.tools.rpent.get("workflow") in {"episode", "pear"}
                 else None,
                 version_end=generated.get("version_end")
-                if self.cfg.tools.rpent.get("workflow") == "episode"
+                if self.cfg.tools.rpent.get("workflow") in {"episode", "pear"}
                 else None,
                 is_end=generated["finish_reason"] == "stop",
                 extra_fields=extra_fields,
             )
         )
-        if self.cfg.tools.rpent.get("workflow") == "episode":
+        if self.cfg.tools.rpent.get("workflow") in {"episode", "pear"}:
             await asyncio.to_thread(
                 write_training_turn,
                 self.cfg.tools.rpent.output_dir,

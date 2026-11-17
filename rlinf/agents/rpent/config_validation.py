@@ -163,11 +163,20 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
         )
 
     workflow = rpent.get("workflow", "libero")
-    if workflow not in ("libero", "libero_rl", "episode"):
+    world_cord = rpent.get("world_cord", "base")
+    if world_cord not in {"base", "general"}:
+        raise ValueError("tools.rpent.world_cord must be base or general")
+    if world_cord != "base" and workflow not in {"episode", "pear"}:
         raise ValueError(
-            f"tools.rpent.workflow must be libero, libero_rl or episode, got {workflow!r}."
+            "general coordinates require the adaptive episode or pear workflow"
         )
-    if workflow in {"libero_rl", "episode"}:
+    if workflow == "pear" and rpent.get("action_mode") != "single":
+        raise ValueError("pear requires action_mode=single")
+    if workflow not in ("libero", "libero_rl", "episode", "pear"):
+        raise ValueError(
+            f"tools.rpent.workflow must be libero, libero_rl, episode or pear, got {workflow!r}."
+        )
+    if workflow in {"libero_rl", "episode", "pear"}:
         mode = agentloop.get("observation_mode", "adaptive")
         if mode != "adaptive":
             raise ValueError(
@@ -204,7 +213,7 @@ def _validate_planner(cfg: DictConfig, rpent: DictConfig) -> None:
                 "agentloop.history_compaction needs target_tokens (image-aware tiers) "
                 "or max_messages (message window)."
             )
-        if workflow == "episode":
+        if workflow in {"episode", "pear"}:
             if rpent.get("entrypoint") != "robots.rl.rl_episode":
                 raise ValueError(
                     "episode requires tools.rpent.entrypoint=robots.rl.rl_episode."
@@ -275,7 +284,7 @@ def _validate_training(cfg: DictConfig, rpent: DictConfig) -> None:
                 "RPent without algorithm.recompute_logprobs needs "
                 "rollout.return_logprobs=True."
             )
-        if workflow in {"libero_rl", "episode"} and (
+        if workflow in {"libero_rl", "episode", "pear"} and (
             cfg.actor.get("pack_traj", True)
             or not cfg.actor.get("expect_multi_modal_inputs", False)
         ):

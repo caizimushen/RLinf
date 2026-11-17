@@ -410,3 +410,19 @@ token masks or saved training records.
 Report task failures, infrastructure failures, selected/cancelled group
 composition, token/turn costs and the exact source/dependency revisions
 separately. A 60-episode training-pool regression is not a held-out benchmark.
+
+Use RGB-Only Control
+--------------------
+
+Select the pear recipe to train with paired RGB images and measured robot state after every action. It inherits the GRPO algorithm and the 32-group, eight-member batch with 40 candidate groups. The only tools are ``move_to`` for absolute poses and ``set_gripper``. Episodes end automatically when the environment reports success or a budget is exhausted. Invalid action replies are normal failures, with no correction request.
+
+Use the same installation, full multimodal planner checkpoint, task manifests and deployment file above. Start a matching RPent backend; a pear-only backend needs no SAM3 endpoint or SAM3 weights. Launch from the Ray head:
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_pear_sync_grpo \
+     --config-dir "$CONFIG_DIR" +deployment@_global_=local
+
+The recipe sets ``tools.rpent.world_cord=general``: positions are measured from the mounting base, with x forward, y left and z up, and the TCP is the measured finger-pad midpoint. The initial observation gives table height above the base. All LIBERO perception coordinates follow this choice when using an existing perception workflow. Set ``tools.rpent.world_cord=base`` to retain simulator-world coordinates and the original control point.
+
+Thinking is enabled by default. Add ``agentloop.chat_template_kwargs.enable_thinking=false`` for direct tool calls without reasoning text. The RPent CLI uses ``--reasoning`` and ``--no-reasoning``. Use separate run directories and pin source revisions when changing workflows or coordinates; an existing SFT workflow remains available with its original defaults.

@@ -1124,3 +1124,116 @@ def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
     assert json.loads((output / "sampling-process-cleanup.json").read_text())[
         "process_exited"
     ]
+
+
+def test_pear_recipe_preserves_grpo_and_exposes_explicit_frame():
+    from rlinf.agents.rpent.config_validation import _validate_planner
+
+    cfg = compose(config_name="train_qwen3.5_4b_pear_sync_grpo")
+    _validate_planner(cfg, cfg.tools.rpent)
+    assert cfg.tools.rpent.world_cord == "general"
+    assert cfg.tools.rpent.action_mode == "single"
+    assert cfg.tools.rpent.sam3_endpoint is None
+    assert (
+        cfg.data.rollout_batch_size,
+        cfg.data.sampling_batch_size,
+        cfg.algorithm.group_size,
+    ) == (32, 40, 8)
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert list(cfg.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert not cfg.critic.use_critic_model
+    cfg.agentloop.chat_template_kwargs.enable_thinking = False
+    planner = RPentAgentLoopWorker._planner_options(
+        SimpleNamespace(cfg=cfg), "http://policy"
+    )
+    assert planner["thinking"] is False and planner["reasoning_effort"] == "none"
+    assert "no_images" not in planner
+    cfg.tools.rpent.action_mode = "batch"
+    with pytest.raises(ValueError, match="action_mode=single"):
+        _validate_planner(cfg, cfg.tools.rpent)
+
+
+def test_pear_launcher_preserves_candidate_cleanup_and_needs_no_sam(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    launcher.cfg.tools.rpent.workflow = "pear"
+    launcher.cfg.tools.rpent.world_cord = "general"
+    launcher.cfg.tools.rpent.action_mode = "single"
+    launcher.cfg.tools.rpent.sam3_endpoint = "http://must-not-be-used"
+    result = asyncio.run(
+        launcher.run(
+            Episode("pear", {}, None),
+            {"thinking": False},
+            0,
+            candidate={"cohort_id": "groups", "candidate_id": 1},
+        )
+    )
+    command = result["args"]
+    assert command[command.index("--workflow") + 1] == "pear"
+    assert command[command.index("--world-cord") + 1] == "general"
+    assert "--sam3-endpoint" not in command
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "pear"
+    assert (
+        json.loads((output / "request.json").read_text())["planner"]["thinking"]
+        is False
+    )
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
+    ]
+
+
+@pytest.mark.parametrize("version", [7, None])
+def test_pear_keeps_synchronous_version_checks_and_training_turns(make_agent, version):
+    fake = FakeRPent(turns=1)
+    worker = make_agent(fake)
+    worker.cfg.tools.rpent.update(
+        {
+            "workflow": "pear",
+            "entrypoint": "robots.libero_rl.rl_episode",
+            "world_cord": "general",
+            "image_size": 1024,
+            "action_mode": "single",
+            "max_actions_per_call": 3,
+            "perception_mode": "single",
+            "reasoning_history": -1,
+            "image_history": -1,
+        }
+    )
+    worker.cfg.runner.synchronous = True
+    worker.cfg.algorithm.sampling_params.update(
+        {
+            "temperature": 1,
+            "top_p": 1,
+            "top_k": -1,
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+        }
+    )
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if version is None:
+        with pytest.raises(ValueError, match="installed weight version"):
+            run_query(worker)
+        return
+    result = run_query(worker)
+    assert result.extra_fields["turns"] == 1
+    assert set(result.single_turn_outputs[0].response_weight_versions) == {7}
+    audits = list(
+        Path(worker.cfg.tools.rpent.output_dir).glob("*/training_audit/*.json")
+    )
+    assert len(audits) == 1
+    audit = json.loads(audits[0].read_text())
+    assert audit["weight_version_start"] == audit["weight_version_end"] == 7

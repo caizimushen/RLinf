@@ -184,8 +184,8 @@ class RPentEpisodeLauncher:
             "--request",
             str(output / "request.json"),
         ]
-        if workflow in {"libero_rl", "episode"}:
-            if workflow == "episode" and rpent.get("record_api_trace", False):
+        if workflow in {"libero_rl", "episode", "pear"}:
+            if workflow in {"episode", "pear"} and rpent.get("record_api_trace", False):
                 command.append("--record-api-trace")
             command += [
                 "--observation-mode",
@@ -195,14 +195,16 @@ class RPentEpisodeLauncher:
             ]
             if rpent.get("remote_toolkit_endpoint") is not None:
                 command += ["--remote-toolkit-endpoint", rpent.remote_toolkit_endpoint]
-            elif rpent.get("sam3_endpoint") is not None:
+            elif workflow != "pear" and rpent.get("sam3_endpoint") is not None:
                 command += ["--sam3-endpoint", rpent.sam3_endpoint]
             if rpent.get("libero_type") is not None:
                 command += ["--libero-type", rpent.libero_type]
-            if workflow == "episode":
+            if workflow in {"episode", "pear"}:
                 command += [
                     "--workflow",
                     workflow,
+                    "--world-cord",
+                    rpent.get("world_cord", "base"),
                     "--image_size",
                     str(rpent.image_size),
                 ]
